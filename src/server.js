@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { decodeSecret, hmacHex, verifyHmac, SIGNATURE_HEADER } from './hmac.js';
+import { decodeSecret, hmacHex, verifyHmac, secretCandidates, SIGNATURE_HEADER } from './hmac.js';
 import { decide } from './decide.js';
 import { proveDecision } from './prove.js';
 import { SeenSet } from './seen.js';
+import { isTurnEnvelope, handleTurn, parseParams, parseSalt, idempotencyKeyFor, CIRCUIT_VERSION } from './vfy.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadEnv(path.join(root, '.env'));
@@ -14,8 +15,28 @@ const PORT = Number(process.env.PORT || 8787);
 const SEEN_PATH = path.resolve(root, process.env.SEEN_PATH || './data/seen.json');
 const SALT = BigInt(process.env.AGENT_GAMES_SALT || '0');
 
-const secret = decodeSecret(requiredEnv('AGENT_GAMES_HMAC_SECRET'));
+let secret = decodeSecret(requiredEnv('AGENT_GAMES_HMAC_SECRET'));
+const SECRET_CANDIDATES = secretCandidates(requiredEnv('AGENT_GAMES_HMAC_SECRET'));
 const seen = new SeenSet(SEEN_PATH);
+const TASK_LOG = path.resolve(root, process.env.TASK_LOG || './data/tasks.log');
+const VFY_PLACEMENT = process.env.VFY_PROOF_PLACEMENT || 'both';
+let VFY_PARAMS = null;
+let VFY_SALT = null;
+try {
+  VFY_PARAMS = parseParams(process.env.STRATEGY_PARAMS);
+  VFY_SALT = parseSalt(process.env.STRATEGY_SALT);
+} catch (e) {
+  console.log('Steal the VFY strategy not configured:', e.message);
+}
+const turnCache = new Map();
+
+function logTask(entry) {
+  // Public task data and our public answer only. Never secrets, params or salt.
+  try {
+    fs.mkdirSync(path.dirname(TASK_LOG), { recursive: true });
+    fs.appendFileSync(TASK_LOG, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n');
+  } catch {}
+}
 
 const app = express();
 app.disable('x-powered-by');
@@ -33,7 +54,11 @@ app.get('/health', (_req, res) => {
 app.post(['/agent', '/'], async (req, res) => {
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body ?? '');
   const sig = req.headers[SIGNATURE_HEADER];
-  if (!verifyHmac(secret, raw, sig)) {
+  const match = SECRET_CANDIDATES.find((k) => verifyHmac(k, raw, sig));
+  if (match) secret = match;
+  if (!match) {
+    const hdr = sig == null ? 'missing' : `len=${String(sig).length} prefix=${String(sig).slice(0, 7).replace(/[0-9a-f]/gi, 'h')}`;
+    console.log(new Date().toISOString(), '401 bad signature', hdr, 'bodylen', raw.length, 'headers', Object.keys(req.headers).filter((h) => h.includes('sig') || h.includes('agent')).join(','));
     res.status(401).json({ error: 'invalid signature' });
     return;
   }
@@ -47,8 +72,14 @@ app.post(['/agent', '/'], async (req, res) => {
   }
 
   try {
-    if (task?.type === 'agent-games.preflight.v1') {
+    if (task?.type === 'agent-games.preflight.v1' || (typeof task?.type === 'string' && task.type.includes('preflight'))) {
+      logTask({ kind: 'preflight', type: task.type });
       signedJson(res, 200, { ok: true, protocolVersion: 'v1' });
+      return;
+    }
+
+    if (isTurnEnvelope(task)) {
+      await handleTurnRequest(task, res);
       return;
     }
 
@@ -86,6 +117,7 @@ app.post(['/agent', '/'], async (req, res) => {
       body.public_signals = proved.public_signals;
     }
 
+    logTask({ kind: 'gatekeeper', task_id: task.task_id, mode: task.mode, input, decision: body.decision, reason_code: body.reason_code, proved: !!body.proof });
     if (task.task_id) seen.rememberTask(task.task_id, body);
     if (verdict.decision === 'APPROVE') seen.rememberApproval(input.proof_tx);
 
@@ -100,6 +132,37 @@ app.post(['/agent', '/'], async (req, res) => {
     });
   }
 });
+
+async function handleTurnRequest(env, res) {
+  const key = `${env.matchId}:${env.turn}`;
+  if (turnCache.has(key)) {
+    signedJson(res, 200, turnCache.get(key));
+    return;
+  }
+  let body;
+  let info = {};
+  try {
+    if (!VFY_PARAMS || !VFY_SALT) throw new Error('strategy not configured');
+    const r = await handleTurn(env, { params: VFY_PARAMS, salt: VFY_SALT, placement: VFY_PLACEMENT });
+    body = r.body;
+    info = { proved: r.proved, error: r.error };
+  } catch (err) {
+    console.error('turn failed', err?.message || err);
+    // Fail closed: HOLD (amount omitted), no invalid proof.
+    body = {
+      matchId: env.matchId,
+      turn: env.turn,
+      action: { type: 'HOLD' },
+      policyProof: { circuitVersion: CIRCUIT_VERSION },
+      agentTimestamp: new Date().toISOString(),
+      idempotencyKey: idempotencyKeyFor(env.matchId, env.turn),
+    };
+    info = { proved: false, error: String(err?.message || err).slice(0, 200) };
+  }
+  if (info.proved) turnCache.set(key, body);
+  logTask({ kind: 'vfy-turn', matchId: env.matchId, turn: env.turn, mode: env.mode, state: env.state, commitment: env.strategyCommitment?.hash, action: body.action, publicInputsHash: body.policyProof?.publicInputsHash, ...info });
+  signedJson(res, 200, body);
+}
 
 function signedJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -141,7 +204,7 @@ function loadEnv(file) {
 
 if (process.env.AGENT_GAMES_BIND !== 'false') {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Proof Gatekeeper listening on :${PORT}  POST /agent`);
+    console.log(`Agent Games agent listening on :${PORT}  POST /agent`);
   });
 }
 

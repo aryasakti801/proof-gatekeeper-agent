@@ -19,10 +19,20 @@ export function hmacHex(secretBytes, body) {
   return createHmac('sha256', secretBytes).update(buf).digest('hex');
 }
 
+/** All plausible key interpretations of the dashboard secret. */
+export function secretCandidates(secret) {
+  const s = String(secret).trim();
+  const out = [decodeSecret(s), Buffer.from(s, 'utf8')];
+  const hex = s.replace(/^0x/i, '');
+  if (/^[0-9a-fA-F]+$/.test(hex) && hex.length % 2 === 0) out.push(Buffer.from(hex, 'hex'));
+  const seen = new Set();
+  return out.filter((b) => { const k = b.toString('hex'); if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
 export function verifyHmac(secretBytes, body, signatureHeader) {
   if (signatureHeader == null || signatureHeader === '') return false;
   const expected = hmacHex(secretBytes, body);
-  const got = String(signatureHeader).trim().toLowerCase().replace(/^0x/, '');
+  const got = String(signatureHeader).trim().toLowerCase().replace(/^sha256=/, '').replace(/^0x/, '');
   const a = Buffer.from(expected, 'hex');
   const b = Buffer.from(got, 'hex');
   if (a.length !== b.length || a.length === 0) return false;

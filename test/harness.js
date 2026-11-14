@@ -6,6 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { createHmac } from 'node:crypto';
 import { decide, REASON } from '../src/decide.js';
 import { proveDecision, verifyProof, VKEY_PATH } from '../src/prove.js';
+import { policy, parseParams, commitmentOf, handleTurn, publicInputsHash, toHex32, VFY_VKEY, isTurnEnvelope } from '../src/vfy.js';
+import { utils as ethersUtils } from 'ethers';
+const { keccak256, solidityPack: solidityPacked } = ethersUtils;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SECRET_HEX = 'ab'.repeat(32);
@@ -109,6 +112,44 @@ for (const [name, task, decision] of proofCases) {
   check(`${name} verified in ${ms}ms`, ok === true && public_signals[11] === String(decision), { ok, d: public_signals[11] });
 }
 
+console.log('2b) Steal the VFY policy + proof');
+const TEST_PARAMS = '10,0,0,0';
+const TEST_SALT = 987654321n;
+const vparams = parseParams(TEST_PARAMS);
+check('policy extract', JSON.stringify(policy({ selfBalance: '95', opponentBalance: '105' }, vparams)) === '{"type":"EXTRACT","amount":10}');
+check('policy hold at opp 0', policy({ selfBalance: '95', opponentBalance: '0' }, vparams).type === 'HOLD');
+const fp = parseParams('5,50,20,0');
+check('policy fortify', JSON.stringify(policy({ selfBalance: '49', opponentBalance: '105' }, fp)) === '{"type":"FORTIFY"}');
+check('policy hold', policy({ selfBalance: '60', opponentBalance: '20' }, fp).type === 'HOLD');
+let threw = false; try { parseParams('11,0,0,0'); } catch { threw = true; }
+check('param p0 > 10 rejected', threw);
+const vcommit = await commitmentOf(vparams, TEST_SALT);
+const vfyVkey = JSON.parse(fs.readFileSync(VFY_VKEY, 'utf8'));
+const turnEnv = (over = {}) => ({
+  protocolVersion: 'v1', eventId: 'steal-the-vfy', mode: 'practice', matchId: '9f4e1b2a-1c2d-4e5f-8a9b-0c1d2e3f4a5b', turn: 3,
+  issuedAt: new Date().toISOString(), deadlineAt: new Date(Date.now() + 300000).toISOString(),
+  state: { selfBalance: '95', opponentBalance: '105', selfFortifiedUntilTurn: null, opponentFortifiedUntilTurn: null },
+  strategyCommitment: { hash: toHex32(vcommit) }, resolverVersion: 'v1', nonce: '3c2f1a', ...over,
+});
+check('turn envelope detected', isTurnEnvelope(turnEnv()));
+{
+  const t0 = Date.now();
+  const { body, proved } = await handleTurn(turnEnv(), { params: vparams, salt: TEST_SALT });
+  const ok = await verifyProof(body.proof, body.public_signals, vfyVkey);
+  check(`turn proof verifies in ${Date.now() - t0}ms`, proved && ok);
+  check('nested proof present', body.policyProof.proof && body.policyProof.public_signals.length === 9);
+  check('echo matchId/turn', body.matchId === turnEnv().matchId && body.turn === 3);
+  check('extract amount 10', body.action.type === 'EXTRACT' && body.action.amount === 10);
+  // reference hash computed independently (ethers solidityPacked uint256 x8)
+  const ref = keccak256(solidityPacked(Array(8).fill('uint256'), [vcommit, BigInt('0x9f4e1b2a1c2d4e5f8a9b0c1d2e3f4a5b'), 3n, 95n, 105n, 2n, 10n, 1n]));
+  check('publicInputsHash matches reference', body.policyProof.publicInputsHash === ref, body.policyProof.publicInputsHash + ' vs ' + ref);
+  check('public signals carry state', body.public_signals[1] === vcommit.toString() && body.public_signals[3] === '3' && body.public_signals[4] === '95' && body.public_signals[5] === '105' && body.public_signals[6] === '2' && body.public_signals[7] === '10' && body.public_signals[8] === '1');
+  const h = await handleTurn(turnEnv({ state: { selfBalance: '95', opponentBalance: '0' } }), { params: vparams, salt: TEST_SALT });
+  check('HOLD omits amount', h.body.action.type === 'HOLD' && !('amount' in h.body.action) && (await verifyProof(h.body.proof, h.body.public_signals, vfyVkey)));
+  const mm = await handleTurn(turnEnv({ strategyCommitment: { hash: '0x1234' } }), { params: vparams, salt: TEST_SALT });
+  check('commitment mismatch -> HOLD unproved', mm.proved === false && mm.body.action.type === 'HOLD');
+}
+
 console.log('3) HTTP endpoint');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-seen-'));
 const env = {
@@ -117,6 +158,9 @@ const env = {
   AGENT_GAMES_HMAC_SECRET: SECRET_HEX,
   SEEN_PATH: path.join(tmp, 'seen.json'),
   AGENT_GAMES_SALT: '0',
+  STRATEGY_PARAMS: '10,0,0,0',
+  STRATEGY_SALT: '987654321',
+  TASK_LOG: path.join(tmp, 'tasks.log'),
 };
 const child = spawn(process.execPath, ['src/server.js'], {
   cwd: root,
@@ -185,6 +229,14 @@ try {
 
   const reuse = await post(envelope({ task_id: 'gk_http_reuse' }, { proof_tx: baseInput.proof_tx }));
   check('reuse after approve has no proof', reuse.json.reason_code === 'PROOF_REUSED' && reuse.json.decision === 'REJECT' && !reuse.json.proof);
+
+  const turn = await post(turnEnv());
+  check('turn 200 signed', turn.status === 200 && turn.sig === sign(turn.text));
+  check('turn EXTRACT proved', turn.json.action?.type === 'EXTRACT' && (await verifyProof(turn.json.proof, turn.json.public_signals, vfyVkey)));
+  const turnAgain = await post(turnEnv());
+  check('turn idempotent', turnAgain.text === turn.text);
+  const pre2 = await post({ protocolVersion: 'v1', eventId: 'steal-the-vfy', type: 'agent-games.preflight.v1', nonce: 'x' });
+  check('preflight w/ eventId', pre2.json.ok === true);
 } finally {
   child.kill('SIGTERM');
   setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000);
