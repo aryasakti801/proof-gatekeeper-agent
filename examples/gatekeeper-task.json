@@ -1,0 +1,18 @@
+{
+  "type": "agent-games.proof-gatekeeper.v1",
+  "task_id": "gk_example_vk_substitution",
+  "mode": "practice",
+  "input": {
+    "registered_vk": "0x7d3a00000000000000000000000000000000000000000000000000000000f291",
+    "proof_vk": "0xa4c100000000000000000000000000000000000000000000000000000000b8ff",
+    "minimum": "1000",
+    "public_balance": "1460",
+    "expiry_block": 8430000,
+    "current_block": 8420000,
+    "recipient": "0xDe42000000000000000000000000000000009f01",
+    "condition_recipient": "0xDe42000000000000000000000000000000009f01",
+    "amount": "500",
+    "max_transfer": "1000",
+    "proof_tx": "0xa8000000000000000000000000000000000000000000000000000000000000002c"
+  }
+}

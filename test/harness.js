@@ -113,11 +113,11 @@ for (const [name, task, decision] of proofCases) {
 }
 
 console.log('2b) Steal the VFY policy + proof');
-const TEST_PARAMS = '10,0,0,0';
+const TEST_PARAMS = '7,40,30,0';
 const TEST_SALT = 987654321n;
 const vparams = parseParams(TEST_PARAMS);
-check('policy extract', JSON.stringify(policy({ selfBalance: '95', opponentBalance: '105' }, vparams)) === '{"type":"EXTRACT","amount":10}');
-check('policy hold at opp 0', policy({ selfBalance: '95', opponentBalance: '0' }, vparams).type === 'HOLD');
+check('policy extract', JSON.stringify(policy({ selfBalance: '95', opponentBalance: '105' }, vparams)) === '{"type":"EXTRACT","amount":7}');
+check('policy hold at opp <= p2', policy({ selfBalance: '95', opponentBalance: '30' }, vparams).type === 'HOLD');
 const fp = parseParams('5,50,20,0');
 check('policy fortify', JSON.stringify(policy({ selfBalance: '49', opponentBalance: '105' }, fp)) === '{"type":"FORTIFY"}');
 check('policy hold', policy({ selfBalance: '60', opponentBalance: '20' }, fp).type === 'HOLD');
@@ -139,12 +139,12 @@ check('turn envelope detected', isTurnEnvelope(turnEnv()));
   check(`turn proof verifies in ${Date.now() - t0}ms`, proved && ok);
   check('nested proof present', body.policyProof.proof && body.policyProof.public_signals.length === 9);
   check('echo matchId/turn', body.matchId === turnEnv().matchId && body.turn === 3);
-  check('extract amount 10', body.action.type === 'EXTRACT' && body.action.amount === 10);
+  check('extract amount 7', body.action.type === 'EXTRACT' && body.action.amount === 7);
   // reference hash computed independently (ethers solidityPacked uint256 x8)
-  const ref = keccak256(solidityPacked(Array(8).fill('uint256'), [vcommit, BigInt('0x9f4e1b2a1c2d4e5f8a9b0c1d2e3f4a5b'), 3n, 95n, 105n, 2n, 10n, 1n]));
+  const ref = keccak256(solidityPacked(Array(8).fill('uint256'), [vcommit, BigInt('0x9f4e1b2a1c2d4e5f8a9b0c1d2e3f4a5b'), 3n, 95n, 105n, 2n, 7n, 1n]));
   check('publicInputsHash matches reference', body.policyProof.publicInputsHash === ref, body.policyProof.publicInputsHash + ' vs ' + ref);
-  check('public signals carry state', body.public_signals[1] === vcommit.toString() && body.public_signals[3] === '3' && body.public_signals[4] === '95' && body.public_signals[5] === '105' && body.public_signals[6] === '2' && body.public_signals[7] === '10' && body.public_signals[8] === '1');
-  const h = await handleTurn(turnEnv({ state: { selfBalance: '95', opponentBalance: '0' } }), { params: vparams, salt: TEST_SALT });
+  check('public signals carry state', body.public_signals[1] === vcommit.toString() && body.public_signals[3] === '3' && body.public_signals[4] === '95' && body.public_signals[5] === '105' && body.public_signals[6] === '2' && body.public_signals[7] === '7' && body.public_signals[8] === '1');
+  const h = await handleTurn(turnEnv({ state: { selfBalance: '95', opponentBalance: '30' } }), { params: vparams, salt: TEST_SALT });
   check('HOLD omits amount', h.body.action.type === 'HOLD' && !('amount' in h.body.action) && (await verifyProof(h.body.proof, h.body.public_signals, vfyVkey)));
   const mm = await handleTurn(turnEnv({ strategyCommitment: { hash: '0x1234' } }), { params: vparams, salt: TEST_SALT });
   check('commitment mismatch -> HOLD unproved', mm.proved === false && mm.body.action.type === 'HOLD');
@@ -158,7 +158,7 @@ const env = {
   AGENT_GAMES_HMAC_SECRET: SECRET_HEX,
   SEEN_PATH: path.join(tmp, 'seen.json'),
   AGENT_GAMES_SALT: '0',
-  STRATEGY_PARAMS: '10,0,0,0',
+  STRATEGY_PARAMS: '7,40,30,0',
   STRATEGY_SALT: '987654321',
   TASK_LOG: path.join(tmp, 'tasks.log'),
 };
